@@ -33,7 +33,7 @@ import re
 import glob
 import json
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 # ── project paths (match what we've been using in Colab) ──────────────
@@ -137,7 +137,7 @@ def load_bindcraft_designs(target_name: str) -> list[str]:
     These PDBs are the FULL COMPLEX (target + binder chains together),
     which is what both PROPKA and PRODIGY need as input.
     """
-    pattern = f"{BINDCRAFT_ROOT}/{target_name}/Accepted/*.pdb"
+    pattern = f"{DRIVE_ROOT}/BindCraft/{target_name}/Accepted/*.pdb"
     designs = sorted(glob.glob(pattern))
     if not designs:
         raise FileNotFoundError(
@@ -172,6 +172,22 @@ def extract_sequences(fasta_path: str) -> list[str]:
         lines = f.read().strip().split("\n")
     seqs = [l.strip() for l in lines if not l.startswith(">")]
     return seqs[1:]  # drop the reference sequence
+
+
+def extract_binder_sequences(fasta_path: str, pdb_path: str, binder_chain: str = "B") -> list[str]:
+    """
+    ProteinMPNN writes every chain of the complex to the .fa file, joined by
+    "/" in alphabetical chain order. Returns only the binder-chain sequence
+    of each redesigned variant (the native record is dropped).
+    """
+    from Bio.PDB import PDBParser
+    chain_ids = sorted(c.id for c in PDBParser(QUIET=True).get_structure("s", pdb_path)[0])
+    idx = chain_ids.index(binder_chain)
+    out = []
+    for s in extract_sequences(fasta_path):
+        parts = s.split("/")
+        out.append(parts[idx] if len(parts) == len(chain_ids) else s)
+    return out
 
 
 # ── STAGE 4: property scoring (the four metrics validated on 9 proteins) ─
@@ -362,8 +378,8 @@ def run_pipeline(
     results = []
     for pdb_path in design_pdbs:
         out_folder = f"{ORYQEVA_ROOT}/results/{request.target_name}"
-        fasta_path = run_mompnn(pdb_path, out_folder, request.chains)
-        sequences = extract_sequences(fasta_path)
+        fasta_path = run_mompnn(pdb_path, out_folder, request.binder_chain)
+        sequences = extract_binder_sequences(fasta_path, pdb_path, request.binder_chain)
 
         # structure-based scores run once per backbone (same for all sequences)
         prodigy = score_prodigy_affinity(pdb_path)
@@ -756,53 +772,526 @@ def get_final_conjugation_strategy(
     }
 
 
+# ── BindCraft backend (validation, settings builder, environment preflight, run + output parsing) ──
+BACKEND_VERSION = "0.1.0"
+DEFAULT_BINDCRAFT_ROOT = "/content/BindCraft"
+
+FILTER_FILES = {
+    "default": "default_filters.json",
+    "relaxed": "relaxed_filters.json",
+    "peptide": "peptide_filters.json",
+    "peptide_relaxed": "peptide_relaxed_filters.json",
+    "none": "no_filters.json",
+}
+
+THREE_TO_ONE = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q",
+    "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K",
+    "MET": "M", "PHE": "F", "PRO": "P", "SER": "S", "THR": "T", "TRP": "W",
+    "TYR": "Y", "VAL": "V",
+}
+
+
+# -- failure classification ------------------------------------------------
+class OryqevaError(RuntimeError):
+    category = "error"
+
+    def __str__(self):
+        return f"[{self.category}] {super().__str__()}"
+
+
+class EnvironmentFailure(OryqevaError):
+    category = "environment"
+
+
+class InputFailure(OryqevaError):
+    category = "input"
+
+
+class SettingsFailure(OryqevaError):
+    category = "settings"
+
+
+class BindCraftFailure(OryqevaError):
+    category = "bindcraft"
+
+
+class OutputFailure(OryqevaError):
+    category = "output"
+
+
+# -- result objects --------------------------------------------------------
+@dataclass
+class BindCraftDesign:
+    design_id: str
+    pdb_path: str
+    sequence: Optional[str]
+    length: Optional[int]
+    metrics: dict = field(default_factory=dict)
+
+
+@dataclass
+class BindCraftRun:
+    design_path: str
+    settings_path: str
+    filters_path: str
+    advanced_path: str
+    log_path: str
+    runtime_seconds: float
+    designs: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+
+    @property
+    def pdb_paths(self):
+        return [d.pdb_path for d in self.designs]
+
+
+# -- input validation ------------------------------------------------------
+_HOTSPOT_TOKEN = re.compile(r"^([A-Za-z]?)(\d+)(?:-(\d+))?$")
+
+
+def parse_hotspots(text: str, default_chain: str) -> list:
+    """
+    Parses BindCraft hotspot syntax: "56,115,123", "1,2-10", "A1-10,B20"
+    or a whole chain such as "A". Returns (chain, start, end) tuples;
+    end is None for a single residue, start is None for a whole chain.
+    """
+    items = []
+    for tok in [t.strip() for t in (text or "").split(",") if t.strip()]:
+        if re.fullmatch(r"[A-Za-z]", tok):
+            items.append((tok, None, None))
+            continue
+        m = _HOTSPOT_TOKEN.match(tok)
+        if not m:
+            raise InputFailure(
+                f"Invalid hotspot '{tok}'. Use BindCraft syntax such as "
+                f"'56,115', '1,2-10' or 'A1-10,B20' (no colons or residue letters)."
+            )
+        chain = m.group(1) or default_chain
+        start = int(m.group(2))
+        end = int(m.group(3)) if m.group(3) else None
+        if end is not None and end < start:
+            raise InputFailure(f"Invalid hotspot range '{tok}': end is before start.")
+        items.append((chain, start, end))
+    return items
+
+
+def validate_target(pdb_path: str, chains: str, hotspots: str = "") -> dict:
+    """Checks the target PDB, its chains and the hotspot residues."""
+    if not os.path.exists(pdb_path):
+        raise InputFailure(f"Target PDB not found: {pdb_path}")
+    try:
+        from Bio.PDB import PDBParser
+        structure = PDBParser(QUIET=True).get_structure("target", pdb_path)
+        model = structure[0]
+    except Exception as e:
+        raise InputFailure(f"Target PDB could not be parsed: {e}")
+
+    chain_ids = [c.id for c in model.get_chains()]
+    wanted = [c.strip() for c in chains.split(",") if c.strip()]
+    if not wanted:
+        raise InputFailure("No target chain given.")
+    info = {"chains": {}, "warnings": []}
+    for ch in wanted:
+        if ch not in chain_ids:
+            raise InputFailure(f"Chain '{ch}' not found in {pdb_path}. Available: {chain_ids}")
+        resnums = {r.id[1] for r in model[ch].get_residues()
+                   if r.id[0] == " " and "CA" in r}
+        if not resnums:
+            raise InputFailure(f"Chain '{ch}' has no standard residues with CA atoms.")
+        info["chains"][ch] = resnums
+
+    n_res = sum(len(v) for v in info["chains"].values())
+    info["n_residues"] = n_res
+    if n_res > 400:
+        info["warnings"].append(
+            f"Target has {n_res} residues. BindCraft needs a lot of GPU memory for "
+            f"large targets; trim the PDB to the region you want to bind."
+        )
+
+    for chain, start, end in parse_hotspots(hotspots, wanted[0]):
+        if chain not in info["chains"]:
+            raise InputFailure(f"Hotspot refers to chain '{chain}', which is not a target chain.")
+        if start is None:
+            continue
+        have = info["chains"][chain]
+        hi = end if end is not None else start
+        if not any(r in have for r in range(start, hi + 1)):
+            raise InputFailure(
+                f"Invalid hotspot: chain {chain} residues {start}"
+                f"{'-' + str(end) if end else ''} were not found in the target structure."
+            )
+        if end is None and start not in have:
+            raise InputFailure(
+                f"Invalid hotspot: chain {chain} residue {start} was not found in the target structure."
+            )
+    return info
+
+
+# -- settings --------------------------------------------------------------
+def prepare_target_pdb(
+    target_input_path: str,
+    chain_id: str = "A",
+    cache_dir: Optional[str] = None,
+    timeout_seconds: int = 120,
+) -> str:
+    """
+    Accepts either a .pdb file (returned unchanged) or a .fasta/.fa file
+    (single sequence, structure predicted with the ESMFold API and saved
+    as a PDB). Returns the path to a PDB file ready for validate_target()
+    and build_bindcraft_settings().
+
+    ESMFold is used only to get a starting structure for a target described
+    by sequence alone — it is not part of binder design itself.
+    """
+    ext = os.path.splitext(target_input_path)[1].lower()
+
+    if ext == ".pdb":
+        if not os.path.exists(target_input_path):
+            raise InputFailure(f"Target PDB not found: {target_input_path}")
+        return target_input_path
+
+    if ext not in (".fasta", ".fa"):
+        raise InputFailure(
+            f"Unsupported target file type '{ext}'. Provide a .pdb, or a "
+            f".fasta/.fa file with one sequence to fold with ESMFold."
+        )
+
+    if not os.path.exists(target_input_path):
+        raise InputFailure(f"Target FASTA not found: {target_input_path}")
+
+    with open(target_input_path) as f:
+        lines = [l.rstrip() for l in f if l.strip()]
+    records = []
+    for line in lines:
+        if line.startswith(">"):
+            records.append("")
+        elif records:
+            records[-1] += line.strip()
+        else:
+            raise InputFailure(f"'{target_input_path}' is not valid FASTA (no header line).")
+    records = [r for r in records if r]
+    if not records:
+        raise InputFailure(f"No sequence found in '{target_input_path}'.")
+    if len(records) > 1:
+        raise InputFailure(
+            f"'{target_input_path}' has {len(records)} sequences. "
+            f"prepare_target_pdb only folds a single-chain target; split multi-chain "
+            f"targets and provide a PDB instead."
+        )
+    seq = records[0].upper()
+    if not set(seq).issubset(set("ACDEFGHIKLMNPQRSTVWY")):
+        raise InputFailure(f"Sequence in '{target_input_path}' has non-standard amino acids.")
+    if len(seq) > 400:
+        raise InputFailure(
+            f"Sequence is {len(seq)} aa. ESMFold folding here is limited to 400 aa; "
+            f"provide an experimental/AlphaFold PDB for larger targets instead."
+        )
+
+    import requests
+    try:
+        resp = requests.post(
+            "https://api.esmatlas.com/foldSequence/v1/pdb/",
+            data=seq, timeout=timeout_seconds,
+        )
+    except requests.RequestException as e:
+        raise InputFailure(f"ESMFold request failed: {e}")
+    if resp.status_code != 200 or not resp.text.strip().startswith(("HEADER", "ATOM")):
+        raise InputFailure(f"ESMFold folding failed (status {resp.status_code}): {resp.text[:200]}")
+
+    pdb_text = resp.text
+    if chain_id != "A":
+        pdb_text = re.sub(r"^(ATOM  .{16})A", lambda m: m.group(1) + chain_id, pdb_text, flags=re.M)
+        pdb_text = re.sub(r"^(TER   .{16})A", lambda m: m.group(1) + chain_id, pdb_text, flags=re.M)
+
+    out_dir = cache_dir or os.path.join(os.path.dirname(target_input_path) or ".", "esmfold_cache")
+    os.makedirs(out_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(target_input_path))[0]
+    out_path = os.path.join(out_dir, f"{stem}_esmfold.pdb")
+    with open(out_path, "w") as f:
+        f.write(pdb_text)
+    return out_path
+
+
+def build_bindcraft_settings(
+    target_pdb_path: str,
+    target_name: str,
+    target_chain: str = "A",
+    hotspot_residues: str = "",
+    binder_lengths: Optional[list] = None,
+    num_designs: int = 5,
+    design_root: Optional[str] = None,
+) -> tuple:
+    """
+    Writes the BindCraft target settings JSON for one target and returns
+    (settings_path, design_path, validation_info). Keys follow the schema of
+    BindCraft's own target settings files.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", target_name or ""):
+        raise SettingsFailure("target_name may only contain letters, digits, '_' and '-'.")
+    lengths = list(binder_lengths or [50, 120])
+    if len(lengths) != 2 or not all(isinstance(x, int) for x in lengths) or not (5 <= lengths[0] <= lengths[1]):
+        raise SettingsFailure(f"binder_lengths must be [min, max] integers, got {lengths}.")
+    if not isinstance(num_designs, int) or num_designs < 1:
+        raise SettingsFailure("num_designs must be a positive integer.")
+
+    target_pdb_path = prepare_target_pdb(target_pdb_path, chain_id=target_chain)
+    info = validate_target(target_pdb_path, target_chain, hotspot_residues)
+
+    design_path = os.path.join(design_root or f"{DRIVE_ROOT}/BindCraft", target_name) + "/"
+    os.makedirs(design_path, exist_ok=True)
+    settings = {
+        "design_path": design_path,
+        "binder_name": target_name,
+        "starting_pdb": target_pdb_path,
+        "chains": target_chain,
+        "target_hotspot_residues": (hotspot_residues or "").strip(),
+        "lengths": lengths,
+        "number_of_final_designs": num_designs,
+    }
+    settings_path = os.path.join(design_path, f"{target_name}.json")
+    try:
+        with open(settings_path, "w") as f:
+            json.dump(settings, f, indent=2)
+    except OSError as e:
+        raise SettingsFailure(f"Could not write settings file: {e}")
+    return settings_path, design_path, info
+
+
+def find_config(root: str, filename: str) -> str:
+    """Locates a BindCraft filter/advanced JSON anywhere under the install."""
+    hits = glob.glob(os.path.join(root, "**", filename), recursive=True)
+    if not hits:
+        available = sorted({os.path.basename(p) for p in
+                            glob.glob(os.path.join(root, "settings_*", "*.json"))})
+        raise SettingsFailure(f"Config '{filename}' not found under {root}. Available: {available[:40]}")
+    return sorted(hits, key=len)[0]
+
+
+def _advanced_with_overrides(advanced_path: str, overrides: dict, design_path: str) -> str:
+    with open(advanced_path) as f:
+        adv = json.load(f)
+    unknown = [k for k in overrides if k not in adv]
+    if unknown:
+        raise SettingsFailure(f"Unknown advanced settings keys: {unknown}")
+    adv.update(overrides)
+    out = os.path.join(design_path, "oryqeva_advanced.json")
+    with open(out, "w") as f:
+        json.dump(adv, f, indent=2)
+    return out
+
+
+# -- environment -----------------------------------------------------------
+_PROBE = r"""
+import json, os, sys
+r = {}
+for m in ("pyrosetta", "colabdesign", "jax", "haiku"):
+    try:
+        __import__(m); r[m] = True
+    except Exception as e:
+        r[m] = False; r[m + "_error"] = str(e)[:200]
+try:
+    import jax; r["jax_backend"] = jax.default_backend()
+except Exception:
+    r["jax_backend"] = None
+sys.path.insert(0, os.getcwd())
+try:
+    import functions; r["bindcraft_functions"] = True
+except Exception as e:
+    r["bindcraft_functions"] = False; r["bindcraft_functions_error"] = str(e)[:200]
+print("ORYQEVA_PROBE" + json.dumps(r))
+"""
+
+
+def check_environment(bindcraft_root: Optional[str] = None, python_exe: Optional[str] = None) -> dict:
+    """Probes BindCraft, its Python packages, the AF2 weights and the GPU."""
+    root = bindcraft_root or DEFAULT_BINDCRAFT_ROOT
+    py = python_exe or sys.executable
+    report = {"python": py, "root": root,
+              "bindcraft_script": os.path.exists(os.path.join(root, "bindcraft.py"))}
+    params = os.path.join(root, "params")
+    report["af2_params"] = os.path.isdir(params) and bool(os.listdir(params))
+    if not report["bindcraft_script"]:
+        return report
+    try:
+        p = subprocess.run([py, "-c", _PROBE], capture_output=True, text=True, cwd=root, timeout=300)
+        line = [l for l in p.stdout.splitlines() if l.startswith("ORYQEVA_PROBE")]
+        report.update(json.loads(line[0][len("ORYQEVA_PROBE"):]) if line else {"probe_error": p.stderr[-300:]})
+    except Exception as e:
+        report["probe_error"] = str(e)
+    return report
+
+
+def assert_environment(report: dict) -> None:
+    problems = []
+    if not report.get("bindcraft_script"):
+        problems.append(f"bindcraft.py not found under {report.get('root')}")
+    if not report.get("af2_params"):
+        problems.append(f"AlphaFold2 weights missing at {report.get('root')}/params")
+    for m in ("pyrosetta", "colabdesign", "jax", "haiku"):
+        if report.get(m) is False:
+            problems.append(f"{m} unavailable ({report.get(m + '_error', '')})")
+    if report.get("bindcraft_functions") is False:
+        problems.append(f"BindCraft 'functions' import failed ({report.get('bindcraft_functions_error', '')})")
+    if "probe_error" in report:
+        problems.append(f"environment probe failed: {report['probe_error']}")
+    if report.get("jax_backend") not in (None, "gpu", "cuda"):
+        problems.append(f"JAX is using '{report.get('jax_backend')}', not a GPU. Switch the runtime to a GPU.")
+    if problems:
+        raise EnvironmentFailure("BindCraft environment incomplete: " + "; ".join(problems))
+
+
+# -- output parsing --------------------------------------------------------
+def sequence_from_pdb(pdb_path: str, chain: str) -> Optional[str]:
+    try:
+        from Bio.PDB import PDBParser
+        model = PDBParser(QUIET=True).get_structure("s", pdb_path)[0]
+        return "".join(THREE_TO_ONE.get(r.resname, "X") for r in model[chain] if r.id[0] == " ")
+    except Exception:
+        return None
+
+
+def _number(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return v
+
+
+def parse_bindcraft_output(design_path: str, binder_chain: str = "B") -> list:
+    """
+    Reads Accepted/*.pdb and the BindCraft stats CSV
+    (final_design_stats.csv, else mpnn_design_stats.csv). Every CSV column is
+    kept in `metrics`; the sequence comes from the CSV or, failing that, from
+    the binder chain of the PDB.
+    """
+    pdbs = sorted(glob.glob(os.path.join(design_path, "Accepted", "*.pdb")))
+    rows = {}
+    for name in ("final_design_stats.csv", "mpnn_design_stats.csv"):
+        path = os.path.join(design_path, name)
+        if os.path.exists(path):
+            try:
+                with open(path, newline="") as f:
+                    for row in csv.DictReader(f):
+                        key = next((row[k] for k in row if k and k.strip().lower() == "design"), None)
+                        if key:
+                            rows[key.strip()] = {k: _number(v) for k, v in row.items() if k}
+            except Exception as e:
+                raise OutputFailure(f"Could not read {path}: {e}")
+            if rows:
+                break
+
+    designs = []
+    for pdb in pdbs:
+        stem = os.path.splitext(os.path.basename(pdb))[0]
+        match = rows.get(stem) or next(
+            (v for k, v in rows.items() if stem.startswith(k + "_model") or stem == k), None)
+        metrics = dict(match) if match else {}
+        seq = None
+        for k, v in metrics.items():
+            if k.strip().lower() == "sequence" and isinstance(v, str):
+                seq = v
+        seq = seq or sequence_from_pdb(pdb, binder_chain)
+        designs.append(BindCraftDesign(stem, pdb, seq, len(seq) if seq else None, metrics))
+    return designs
+
+
+def collect_designs(target_name: str, design_root: Optional[str] = None, binder_chain: str = "B") -> list:
+    """Parses an already finished BindCraft run for this target."""
+    path = os.path.join(design_root or f"{DRIVE_ROOT}/BindCraft", target_name)
+    return parse_bindcraft_output(path, binder_chain)
+
+
+# -- running ---------------------------------------------------------------
+def _git_commit(root: str) -> Optional[str]:
+    try:
+        return subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True,
+                              text=True, timeout=10).stdout.strip() or None
+    except Exception:
+        return None
+
+
 def run_bindcraft(
     target_pdb_path: str,
     target_name: str,
     target_chain: str = "A",
     hotspot_residues: str = "",
     num_designs: int = 5,
-) -> str:
+    binder_lengths: Optional[list] = None,
+    filter_profile: str = "default",
+    advanced_profile: str = "default_4stage_multimer",
+    advanced_overrides: Optional[dict] = None,
+    bindcraft_root: Optional[str] = None,
+    python_exe: Optional[str] = None,
+    design_root: Optional[str] = None,
+    timeout_hours: float = 11.0,
+    preflight: bool = True,
+    progress_every_seconds: int = 300,
+) -> BindCraftRun:
     """
-    Runs BindCraft end-to-end on a target structure to generate binder
-    backbones, then returns the path to the output folder (which
-    load_bindcraft_designs() can then read).
-
-    This closes the gap where the pipeline previously assumed BindCraft
-    had already been run manually — now it can be triggered from within
-    the same Oryqeva call chain.
-
-    NOTE: the exact CLI flag names below are based on BindCraft's
-    documented usage pattern, NOT a verified run in this environment —
-    check `python bindcraft.py --help` in the installed repo once and
-    adjust the cmd list if the flags differ (same caveat as
-    suggest_hotspots_iara).
-
-    Requires BindCraft installed at BINDCRAFT_ROOT (cloned + its own
-    conda/pip environment set up per the BindCraft repo instructions —
-    this function does not install BindCraft itself, only invokes it).
+    Validate inputs -> preflight environment -> write settings -> run
+    `bindcraft.py --settings --filters --advanced` -> parse results.
+    Re-running with the same target continues the existing BindCraft campaign.
     """
-    import subprocess
+    root = bindcraft_root or DEFAULT_BINDCRAFT_ROOT
+    py = python_exe or sys.executable
+    if filter_profile not in FILTER_FILES:
+        raise SettingsFailure(f"filter_profile must be one of {list(FILTER_FILES)}")
 
-    out_folder = f"{BINDCRAFT_ROOT}/{target_name}"
-    cmd = [
-        "python", f"{BINDCRAFT_ROOT}/bindcraft.py",
-        "--target_pdb", target_pdb_path,
-        "--target_chain", target_chain,
-        "--hotspot_residues", hotspot_residues,
-        "--output", out_folder,
-        "--num_designs", str(num_designs),
-        "--weights_pae_inter", "1.0",
-        "--num_recycles_design", "3",
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-        if proc.returncode != 0:
-            raise RuntimeError(f"BindCraft failed: {proc.stderr[:500]}")
-    except Exception as e:
-        raise RuntimeError(f"BindCraft run error: {e}")
+    settings_path, design_path, info = build_bindcraft_settings(
+        target_pdb_path, target_name, target_chain, hotspot_residues,
+        binder_lengths, num_designs, design_root)
 
-    return out_folder
+    if preflight:
+        assert_environment(check_environment(root, py))
+
+    filters_path = find_config(root, FILTER_FILES[filter_profile])
+    advanced_path = find_config(root, advanced_profile + ".json")
+    if advanced_overrides:
+        advanced_path = _advanced_with_overrides(advanced_path, advanced_overrides, design_path)
+
+    log_path = os.path.join(design_path, "oryqeva_run.log")
+    provenance = {
+        "oryqeva_backend_version": BACKEND_VERSION,
+        "started": datetime.datetime.now().isoformat(timespec="seconds"),
+        "python": sys.version.split()[0],
+        "bindcraft_commit": _git_commit(root),
+        "settings": json.load(open(settings_path)),
+        "filters": os.path.basename(filters_path),
+        "advanced": os.path.basename(advanced_path),
+        "advanced_overrides": advanced_overrides or {},
+    }
+    with open(os.path.join(design_path, "oryqeva_provenance.json"), "w") as f:
+        json.dump(provenance, f, indent=2)
+
+    cmd = [py, os.path.join(root, "bindcraft.py"), "--settings", settings_path,
+           "--filters", filters_path, "--advanced", advanced_path]
+    t0 = time.time()
+    last = t0
+    with open(log_path, "a") as log:
+        log.write(f"\n=== {provenance['started']} {' '.join(cmd)}\n")
+        log.flush()
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=root)
+        while proc.poll() is None:
+            time.sleep(5)
+            now = time.time()
+            if now - t0 > timeout_hours * 3600:
+                proc.kill()
+                raise BindCraftFailure(f"Timed out after {timeout_hours} h. Re-run to continue; see {log_path}")
+            if now - last >= progress_every_seconds:
+                n = len(glob.glob(os.path.join(design_path, "Accepted", "*.pdb")))
+                print(f"  {int((now - t0) / 60)} min | accepted so far: {n}")
+                last = now
+    if proc.returncode != 0:
+        with open(log_path) as f:
+            tail = f.read()[-1500:]
+        raise BindCraftFailure(f"BindCraft exited with code {proc.returncode}. Log tail:\n{tail}")
+
+    designs = parse_bindcraft_output(design_path)
+    if not designs:
+        raise OutputFailure(f"BindCraft finished but no accepted designs were found in {design_path}Accepted/")
+    return BindCraftRun(design_path, settings_path, filters_path, advanced_path, log_path,
+                        time.time() - t0, designs, info["warnings"])
 
 
 def classify_v2(oryqeva_score: float, strategy: str) -> str:
