@@ -33,6 +33,10 @@ import re
 import glob
 import json
 import subprocess
+import csv
+import sys
+import time
+import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -1013,6 +1017,168 @@ def prepare_target_pdb(
     return out_path
 
 
+def estimate_bindcraft_memory_mb(target_pdb_path: str, target_chain: str, max_binder_length: int) -> dict:
+    """
+    Rough VRAM estimate for a BindCraft/ColabDesign hallucination run, based
+    on total sequence length (target + binder) passed through AlphaFold2.
+    AF2/ColabDesign memory scales roughly with the square of sequence length
+    (due to the pair representation), so this is quadratic, not linear.
+    """
+    from Bio.PDB import PDBParser
+    model = PDBParser(QUIET=True).get_structure("t", target_pdb_path)[0]
+    chain_ids = [c.strip() for c in target_chain.split(",") if c.strip()]
+    target_len = sum(1 for cid in chain_ids for r in model[cid] if r.id[0] == " ")
+    total_len = target_len + max_binder_length
+    est_mb = round((total_len ** 2) * 0.043)
+    return {"target_length": target_len, "max_binder_length": max_binder_length,
+            "total_length": total_len, "estimated_mb": est_mb, "estimated_gb": round(est_mb / 1024, 1)}
+
+
+def check_target_size(target_pdb_path: str, target_chain: str, max_binder_length: int,
+                       available_gpu_mb: Optional[int] = None) -> dict:
+    """
+    Warns before a BindCraft run if the target is large enough to likely
+    exhaust GPU memory, and suggests a fix. Prevents wasting GPU time on a
+    run that would fail with RESOURCE_EXHAUSTED partway through.
+    """
+    est = estimate_bindcraft_memory_mb(target_pdb_path, target_chain, max_binder_length)
+    budget_mb = available_gpu_mb or 15000
+    est["gpu_budget_mb"] = budget_mb
+    est["fits"] = est["estimated_mb"] < budget_mb * 0.85
+    if not est["fits"]:
+        import math
+        max_total_len = math.isqrt(int(budget_mb * 0.85 / 0.043))
+        est["suggested_max_target_length"] = max(max_total_len - max_binder_length, 50)
+        est["message"] = (
+            f"Target chain '{target_chain}' is {est['target_length']} residues. "
+            f"Combined with a {max_binder_length}-residue binder, this is estimated "
+            f"to need ~{est['estimated_gb']} GB of GPU memory, which is likely to "
+            f"exceed the available ~{budget_mb/1024:.0f} GB and fail with an "
+            f"out-of-memory error partway through the run. "
+            f"BindCraft works on a defined epitope, not a whole receptor -- trim "
+            f"the target PDB to the region around your hotspot residues "
+            f"(roughly {est['suggested_max_target_length']} residues or fewer) "
+            f"before running."
+        )
+    else:
+        est["message"] = (
+            f"Target chain '{target_chain}' is {est['target_length']} residues "
+            f"(~{est['estimated_gb']} GB estimated) -- should fit in "
+            f"~{budget_mb/1024:.0f} GB of GPU memory."
+        )
+    return est
+
+
+def auto_trim_target(
+    target_pdb_path: str,
+    target_chain: str,
+    hotspot_residues: str,
+    max_binder_length: int,
+    available_gpu_mb: Optional[int] = None,
+    padding: int = 40,
+    output_dir: Optional[str] = None,
+) -> dict:
+    """
+    If the target is too large to fit in GPU memory (per check_target_size),
+    trims it down to a contiguous window centred on the hotspot residues
+    (or on the chain midpoint, if no hotspots were given), with `padding`
+    extra residues on each side for structural context.
+
+    This mirrors BindCraft's own documented guidance: target a functional
+    epitope/domain rather than a whole receptor. The person is always told
+    exactly what was trimmed and why -- this never trims silently.
+
+    Returns a dict: {"pdb_path": ..., "trimmed": bool, "message": str,
+    "kept_range": (start, end) or None}.
+    """
+    from Bio.PDB import PDBParser, PDBIO, Select
+    import os as _os
+
+    size_check = check_target_size(target_pdb_path, target_chain, max_binder_length, available_gpu_mb)
+    if size_check["fits"]:
+        return {"pdb_path": target_pdb_path, "trimmed": False,
+                "message": size_check["message"], "kept_range": None}
+
+    chain_ids = [c.strip() for c in target_chain.split(",") if c.strip()]
+    if len(chain_ids) != 1:
+        raise InputFailure(
+            f"Target is too large ({size_check['estimated_gb']} GB estimated) and "
+            f"spans multiple chains ('{target_chain}'), so it cannot be auto-trimmed "
+            f"to a single window. Trim the target PDB to your epitope of interest "
+            f"manually before running."
+        )
+    chain_id = chain_ids[0]
+
+    structure = PDBParser(QUIET=True).get_structure("t", target_pdb_path)
+    model = structure[0]
+    if chain_id not in [c.id for c in model.get_chains()]:
+        raise InputFailure(f"Chain '{chain_id}' not found in {target_pdb_path}.")
+
+    resnums = sorted(r.id[1] for r in model[chain_id] if r.id[0] == " ")
+    if not resnums:
+        raise InputFailure(f"Chain '{chain_id}' has no standard residues.")
+
+    hotspot_positions = []
+    for chain, start, end in parse_hotspots(hotspot_residues, chain_id):
+        if chain != chain_id or start is None:
+            continue
+        hotspot_positions.append(start)
+        if end is not None:
+            hotspot_positions.append(end)
+
+    if hotspot_positions:
+        center_lo, center_hi = min(hotspot_positions), max(hotspot_positions)
+    else:
+        mid = resnums[len(resnums) // 2]
+        center_lo = center_hi = mid
+
+    max_window = max(size_check["suggested_max_target_length"], 50)
+
+    window_start = center_lo - padding
+    window_end = center_hi + padding
+    if window_end - window_start + 1 > max_window:
+        mid = (center_lo + center_hi) // 2
+        window_start = mid - max_window // 2
+        window_end = window_start + max_window - 1
+
+    window_start = max(window_start, resnums[0])
+    window_end = min(window_end, resnums[-1])
+
+    class _RangeSelect(Select):
+        def __init__(self, chain, lo, hi):
+            self.chain, self.lo, self.hi = chain, lo, hi
+        def accept_chain(self, c):
+            return c.id == self.chain
+        def accept_residue(self, r):
+            return r.id[0] == " " and self.lo <= r.id[1] <= self.hi
+
+    out_dir = output_dir or _os.path.join(_os.path.dirname(target_pdb_path) or ".", "auto_trimmed")
+    _os.makedirs(out_dir, exist_ok=True)
+    stem = _os.path.splitext(_os.path.basename(target_pdb_path))[0]
+    out_path = _os.path.join(out_dir, f"{stem}_trim{window_start}-{window_end}.pdb")
+
+    io = PDBIO()
+    io.set_structure(structure)
+    io.save(out_path, _RangeSelect(chain_id, window_start, window_end))
+
+    kept_n = sum(1 for rn in resnums if window_start <= rn <= window_end)
+    hotspot_note = (
+        f"centred on hotspot residues {min(hotspot_positions)}-{max(hotspot_positions)}"
+        if hotspot_positions else "centred on the chain midpoint (no hotspots given)"
+    )
+    message = (
+        f"Target chain '{chain_id}' was {size_check['target_length']} residues "
+        f"(~{size_check['estimated_gb']} GB estimated), too large for the available "
+        f"GPU memory. Auto-trimmed to residues {window_start}-{window_end} "
+        f"({kept_n} residues, {hotspot_note} with {padding}-residue padding). "
+        f"Saved to: {out_path}. Review the trimmed structure before a large run -- "
+        f"this is a heuristic window, not a verified functional domain boundary."
+    )
+
+    return {"pdb_path": out_path, "trimmed": True, "message": message,
+            "kept_range": (window_start, window_end)}
+
+
 def build_bindcraft_settings(
     target_pdb_path: str,
     target_name: str,
@@ -1227,6 +1393,7 @@ def run_bindcraft(
     timeout_hours: float = 11.0,
     preflight: bool = True,
     progress_every_seconds: int = 300,
+    auto_trim: bool = True,
 ) -> BindCraftRun:
     """
     Validate inputs -> preflight environment -> write settings -> run
@@ -1237,6 +1404,20 @@ def run_bindcraft(
     py = python_exe or sys.executable
     if filter_profile not in FILTER_FILES:
         raise SettingsFailure(f"filter_profile must be one of {list(FILTER_FILES)}")
+
+    max_binder_length = (binder_lengths or [50, 120])[1]
+    trim_result = None
+    if auto_trim:
+        trim_result = auto_trim_target(
+            target_pdb_path, target_chain, hotspot_residues, max_binder_length
+        )
+        if trim_result["trimmed"]:
+            print(trim_result["message"])
+            target_pdb_path = trim_result["pdb_path"]
+    else:
+        size_check = check_target_size(target_pdb_path, target_chain, max_binder_length)
+        if not size_check["fits"]:
+            raise InputFailure(size_check["message"])
 
     settings_path, design_path, info = build_bindcraft_settings(
         target_pdb_path, target_name, target_chain, hotspot_residues,
@@ -1260,6 +1441,7 @@ def run_bindcraft(
         "filters": os.path.basename(filters_path),
         "advanced": os.path.basename(advanced_path),
         "advanced_overrides": advanced_overrides or {},
+        "auto_trim": trim_result,
     }
     with open(os.path.join(design_path, "oryqeva_provenance.json"), "w") as f:
         json.dump(provenance, f, indent=2)
