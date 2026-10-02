@@ -40,11 +40,21 @@ import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 
-# ── project paths (match what we've been using in Colab) ──────────────
+# ── project paths ────────────────────────────────────────────────────
+# DRIVE_ROOT only matters for Colab (where BindCraft results live on Drive);
+# it is overridden by run_bindcraft()/the notebook on any other machine.
 DRIVE_ROOT = "/content/drive/MyDrive"
 BINDCRAFT_ROOT = f"{DRIVE_ROOT}/BindCraft"
 ORYQEVA_ROOT = f"{DRIVE_ROOT}/Oryqeva"
-MOMPNN_CKPT = f"{ORYQEVA_ROOT}/checkpoints/mompnn_run/mompnn_sol.pt"
+
+# MoMPNN and ProteinMPNN are fetched on demand into a stable, OS-independent
+# cache under the user's home directory -- this works the same on Colab, a
+# local Linux/WSL machine, or any other environment, with no manual copying.
+ORYQEVA_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".oryqeva")
+MOMPNN_CKPT = os.path.join(ORYQEVA_CACHE_DIR, "checkpoints", "mompnn_sol.pt")
+MOMPNN_CKPT_URL = "https://raw.githubusercontent.com/AhSalama-90/oryqeva/main/checkpoints/mompnn_run/mompnn_sol.pt"
+PROTEINMPNN_REPO_URL = "https://github.com/dauparas/ProteinMPNN.git"
+PROTEINMPNN_DIR = os.path.join(ORYQEVA_CACHE_DIR, "ProteinMPNN")
 
 
 @dataclass
@@ -152,22 +162,100 @@ def load_bindcraft_designs(target_name: str) -> list[str]:
 
 
 # ── STAGE 3: MoMPNN sequence design (reuses the exact call we validated) ─
-def run_mompnn(pdb_path: str, out_folder: str, chains: str = "A") -> str:
+def ensure_mompnn_checkpoint(checkpoint_path: str = None, url: str = None) -> str:
     """
-    Calls protein_mpnn_run.py with the MoMPNN checkpoint.
+    Returns a local path to the solubility-tuned MoMPNN checkpoint,
+    downloading it from the Oryqeva GitHub repo the first time it is
+    needed on this machine. Safe to call every run -- it is a no-op once
+    the file is cached.
+    """
+    checkpoint_path = checkpoint_path or MOMPNN_CKPT
+    url = url or MOMPNN_CKPT_URL
+    if os.path.exists(checkpoint_path):
+        return checkpoint_path
+
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    try:
+        import requests
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        tmp_path = checkpoint_path + ".part"
+        with open(tmp_path, "wb") as f:
+            f.write(resp.content)
+        os.replace(tmp_path, checkpoint_path)
+    except Exception as e:
+        raise InputFailure(
+            f"Could not download the MoMPNN checkpoint from {url}: {e}. "
+            f"Place it manually at {checkpoint_path} and re-run."
+        )
+    return checkpoint_path
+
+
+def ensure_proteinmpnn_script(repo_dir: str = None) -> str:
+    """
+    Returns the local path to ProteinMPNN's protein_mpnn_run.py, cloning
+    the official ProteinMPNN repository the first time it is needed on
+    this machine (it ships only the base-model architecture code; the
+    actual weights used are the MoMPNN checkpoint from
+    ensure_mompnn_checkpoint(), passed in separately).
+    """
+    repo_dir = repo_dir or PROTEINMPNN_DIR
+    script_path = os.path.join(repo_dir, "protein_mpnn_run.py")
+    if os.path.exists(script_path):
+        return script_path
+
+    os.makedirs(os.path.dirname(repo_dir), exist_ok=True)
+    try:
+        proc = subprocess.run(
+            ["git", "clone", "--quiet", "--depth", "1", PROTEINMPNN_REPO_URL, repo_dir],
+            capture_output=True, text=True, timeout=120,
+        )
+        if proc.returncode != 0 or not os.path.exists(script_path):
+            raise RuntimeError(proc.stderr[:300])
+    except Exception as e:
+        raise InputFailure(
+            f"Could not clone ProteinMPNN from {PROTEINMPNN_REPO_URL}: {e}. "
+            f"Clone it manually to {repo_dir} and re-run."
+        )
+    return script_path
+
+
+def run_mompnn(
+    pdb_path: str,
+    out_folder: str,
+    chains: str = "A",
+    python_exe: str = None,
+) -> str:
+    """
+    Redesigns the given chain(s) with the solubility-tuned MoMPNN
+    checkpoint, fetching the checkpoint and the ProteinMPNN script
+    automatically on first use (see ensure_mompnn_checkpoint and
+    ensure_proteinmpnn_script -- no manual setup required on any machine).
     Returns the path to the resulting .fa file.
     """
+    checkpoint_path = ensure_mompnn_checkpoint()
+    script_path = ensure_proteinmpnn_script()
+    py = python_exe or sys.executable
+
     pdb_id = os.path.splitext(os.path.basename(pdb_path))[0]
-    cmd = (
-        f'python /content/drive/MyDrive/Oryqeva/tools/ProteinMPNN/protein_mpnn_run.py '
-        f'--pdb_path "{pdb_path}" '
-        f'--pdb_path_chains "{chains}" '
-        f'--out_folder "{out_folder}" '
-        f'--path_to_model_weights "{os.path.dirname(MOMPNN_CKPT)}" '
-        f'--model_name "{os.path.splitext(os.path.basename(MOMPNN_CKPT))[0]}" '
-        f'--num_seq_per_target 8 --sampling_temp "0.1" --seed 37 --batch_size 1'
-    )
-    os.system(cmd)
+    os.makedirs(out_folder, exist_ok=True)
+
+    cmd = [
+        py, script_path,
+        "--pdb_path", pdb_path,
+        "--pdb_path_chains", chains,
+        "--out_folder", out_folder,
+        "--path_to_model_weights", os.path.dirname(checkpoint_path),
+        "--model_name", os.path.splitext(os.path.basename(checkpoint_path))[0],
+        "--num_seq_per_target", "8",
+        "--sampling_temp", "0.1",
+        "--seed", "37",
+        "--batch_size", "1",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        raise BindCraftFailure(f"MoMPNN run failed: {proc.stderr[-800:]}")
+
     return f"{out_folder}/seqs/{pdb_id}.fa"
 
 
