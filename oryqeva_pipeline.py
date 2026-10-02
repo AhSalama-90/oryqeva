@@ -1017,6 +1017,30 @@ def prepare_target_pdb(
     return out_path
 
 
+def detect_gpu_memory_mb() -> Optional[int]:
+    """
+    Detects free GPU memory in MB via `nvidia-smi`. Returns None if nvidia-smi
+    is unavailable or fails to parse, so callers can fall back to a
+    conservative default (e.g. for CI/testing environments without a GPU).
+
+    This replaces the previous hardcoded 15000 MB (Colab T4) default in
+    check_target_size() / auto_trim_target(), so the memory guard works
+    correctly on any machine -- Colab, a local 8 GB laptop GPU, or a
+    multi-GPU workstation (the minimum across GPUs is used, conservatively).
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        values = [int(v.strip()) for v in result.stdout.strip().split("\n") if v.strip()]
+        return min(values) if values else None
+    except Exception:
+        return None
+
+
 def estimate_bindcraft_memory_mb(target_pdb_path: str, target_chain: str, max_binder_length: int) -> dict:
     """
     Rough VRAM estimate for a BindCraft/ColabDesign hallucination run, based
@@ -1042,7 +1066,7 @@ def check_target_size(target_pdb_path: str, target_chain: str, max_binder_length
     run that would fail with RESOURCE_EXHAUSTED partway through.
     """
     est = estimate_bindcraft_memory_mb(target_pdb_path, target_chain, max_binder_length)
-    budget_mb = available_gpu_mb or 15000
+    budget_mb = available_gpu_mb or detect_gpu_memory_mb() or 15000
     est["gpu_budget_mb"] = budget_mb
     est["fits"] = est["estimated_mb"] < budget_mb * 0.85
     if not est["fits"]:
