@@ -235,7 +235,8 @@ def run_mompnn(
     """
     checkpoint_path = ensure_mompnn_checkpoint()
     script_path = ensure_proteinmpnn_script()
-    py = python_exe or sys.executable
+    # Lets MPNN run in its own env (e.g. one whose PyTorch build supports newer GPUs)
+    py = python_exe or os.environ.get("ORYQEVA_MPNN_PYTHON") or sys.executable
 
     pdb_id = os.path.splitext(os.path.basename(pdb_path))[0]
     os.makedirs(out_folder, exist_ok=True)
