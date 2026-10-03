@@ -1929,7 +1929,7 @@ def export_competition_csv(entries: list, out_path: str, max_designs: int = 20,
         raise OutputFailure(f"No valid designs to write. Skipped: {skipped}")
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     with open(out_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["name", "sequence", "molecule_class"])
+        w = csv.DictWriter(f, fieldnames=["name", "sequence", "molecule_class"], lineterminator="\n")
         w.writeheader()
         w.writerows(written)
     return {"path": out_path, "n_written": len(written), "skipped": skipped}
