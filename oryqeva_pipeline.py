@@ -253,6 +253,12 @@ def run_mompnn(
         "--batch_size", "1",
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0 and "CUDA" in proc.stderr:
+        # Newer GPUs (e.g. RTX 50-series) can be unsupported by the installed PyTorch
+        # build ("no kernel image is available"). MPNN is small, so retry on CPU.
+        print("MoMPNN: GPU run failed with a CUDA error; retrying on CPU.")
+        cpu_env = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, env=cpu_env)
     if proc.returncode != 0:
         raise BindCraftFailure(f"MoMPNN run failed: {proc.stderr[-800:]}")
 
