@@ -1629,6 +1629,313 @@ def classify_v2(oryqeva_score: float, strategy: str) -> str:
         return "Tier 3 - low confidence"
 
 
+# ===========================================================================
+# CONDITIONAL-BINDER TOOLKIT
+#
+# Post-processing for accepted BindCraft designs when the goal is a binder
+# that is conditional (pH-dependent) and/or must cross-react between species:
+#   find_interface_residues / target_contact_residues  - contact analysis
+#   his_protonated_fraction                            - Henderson-Hasselbalch
+#   propose_histidine_variants                         - pH-switch candidates
+#   epitope_conservation                               - ortholog check
+#   rank_designs / export_competition_csv              - ranked, validated CSV
+#
+# IMPORTANT: none of this predicts binding. The histidine step in particular
+# is a heuristic that proposes variants; it does not tell you whether a
+# variant binds at pH 6.5 or releases at pH 7.4. Only an experiment does.
+# ===========================================================================
+
+_CANONICAL_AA = set("ACDEFGHIKLMNPQRSTVWY")
+_ACIDIC_ATOMS = {("ASP", "OD1"), ("ASP", "OD2"), ("GLU", "OE1"), ("GLU", "OE2")}
+DEFAULT_HIS_REPLACEABLE = "STNQAKR"
+
+
+def his_protonated_fraction(pka: float, ph: float) -> float:
+    """Henderson-Hasselbalch: fraction of a histidine side chain that is protonated."""
+    return 1.0 / (1.0 + 10 ** (ph - pka))
+
+
+def _standard_residues(chain):
+    return [r for r in chain if r.id[0] == " "]
+
+
+def _load_two_chains(pdb_path: str, binder_chain: str, target_chain: str):
+    from Bio.PDB import PDBParser
+    try:
+        model = PDBParser(QUIET=True).get_structure("s", pdb_path)[0]
+    except Exception as e:
+        raise InputFailure(f"Could not read {pdb_path}: {e}")
+    chains = {c.id for c in model}
+    for cid in (binder_chain, target_chain):
+        if cid not in chains:
+            raise InputFailure(f"Chain '{cid}' not found in {pdb_path} (chains present: {sorted(chains)}).")
+    return model[binder_chain], model[target_chain]
+
+
+def find_interface_residues(pdb_path: str, binder_chain: str = "B", target_chain: str = "A",
+                            contact_cutoff: float = 5.0) -> list:
+    """
+    Binder residues with any heavy atom within `contact_cutoff` A of the target.
+
+    Each entry: position (1-based index in the binder sequence), resnum (PDB
+    number), aa, n_contacts (target atoms in range), acid_distance (A from the
+    nearest side-chain atom of this residue to a target Asp/Glu carboxylate
+    oxygen, None if the target has none).
+    """
+    from Bio.PDB import NeighborSearch
+    binder, target = _load_two_chains(pdb_path, binder_chain, target_chain)
+    target_atoms = [a for r in _standard_residues(target) for a in r]
+    acid_atoms = [a for r in _standard_residues(target) for a in r
+                  if (r.resname, a.get_id()) in _ACIDIC_ATOMS]
+    if not target_atoms:
+        raise InputFailure(f"Target chain '{target_chain}' has no standard residues.")
+    ns = NeighborSearch(target_atoms)
+
+    out = []
+    for pos, res in enumerate(_standard_residues(binder), start=1):
+        n_contacts = 0
+        for atom in res:
+            n_contacts += len(ns.search(atom.coord, contact_cutoff))
+        if n_contacts == 0:
+            continue
+        side = [a for a in res if a.get_id() not in ("N", "C", "O")] or list(res)
+        # for Gly this falls back to CA; for others it includes CA, which is fine
+        acid_dist = None
+        if acid_atoms:
+            acid_dist = min(float(((s.coord - o.coord) ** 2).sum() ** 0.5)
+                            for s in side for o in acid_atoms)
+        out.append({"position": pos, "resnum": res.id[1],
+                    "aa": THREE_TO_ONE.get(res.resname, "X"),
+                    "n_contacts": n_contacts, "acid_distance": acid_dist})
+    return out
+
+
+def target_contact_residues(pdb_path: str, binder_chain: str = "B", target_chain: str = "A",
+                            contact_cutoff: float = 5.0) -> list:
+    """Target residues (resnum, aa) within `contact_cutoff` A of the binder."""
+    from Bio.PDB import NeighborSearch
+    binder, target = _load_two_chains(pdb_path, binder_chain, target_chain)
+    binder_atoms = [a for r in _standard_residues(binder) for a in r]
+    if not binder_atoms:
+        raise InputFailure(f"Binder chain '{binder_chain}' has no standard residues.")
+    ns = NeighborSearch(binder_atoms)
+    hits = []
+    for res in _standard_residues(target):
+        if any(ns.search(a.coord, contact_cutoff) for a in res):
+            hits.append((res.id[1], THREE_TO_ONE.get(res.resname, "X")))
+    return hits
+
+
+def propose_histidine_variants(pdb_path: str, binder_chain: str = "B", target_chain: str = "A",
+                               sequence: Optional[str] = None, n_his_options=(2, 3, 4),
+                               contact_cutoff: float = 5.0, acid_cutoff: float = 7.0,
+                               replaceable: str = DEFAULT_HIS_REPLACEABLE,
+                               assumed_his_pka: float = 6.5,
+                               ph_low: float = 6.5, ph_high: float = 7.4) -> dict:
+    """
+    Proposes histidine-enriched variants of a binder, aimed at binding that is
+    stronger at low pH than at neutral pH.
+
+    Rationale: a histidine is more often protonated (positively charged) at
+    pH 6.5 than at 7.4, so a His placed next to a target Asp/Glu can form a
+    charge interaction that exists mainly at low pH. Sites are ranked by
+    distance to the nearest target carboxylate; only interface residues whose
+    amino acid is in `replaceable` are considered, and Cys/Pro/Gly/His/Trp
+    and hydrophobic core-like residues are left alone by default.
+
+    LIMITS (read before using): this is a heuristic. The pH window is narrow
+    (6.5 vs 7.4), so even an ideal His only changes its protonated fraction
+    modestly -- see `protonation` in the result. Nothing here estimates
+    binding affinity at either pH, and a substitution can just as easily
+    weaken binding at both. Treat every variant as a hypothesis to test.
+    """
+    interface = find_interface_residues(pdb_path, binder_chain, target_chain, contact_cutoff)
+    binder, _ = _load_two_chains(pdb_path, binder_chain, target_chain)
+    pdb_seq = "".join(THREE_TO_ONE.get(r.resname, "X") for r in _standard_residues(binder))
+    if sequence is not None and sequence != pdb_seq:
+        raise InputFailure(
+            "Provided sequence does not match the binder chain in the PDB "
+            f"(sequence length {len(sequence)}, PDB chain length {len(pdb_seq)}). "
+            "Pass the sequence of the same design, or omit `sequence`.")
+    seq = pdb_seq
+
+    warnings = []
+    if not interface:
+        raise InputFailure("No binder residues are within contact range of the target; "
+                           "is this a complex structure with both chains placed together?")
+    if not any(s["acid_distance"] is not None for s in interface):
+        warnings.append("Target has no Asp/Glu near the interface; sites are ranked by contacts only.")
+
+    candidates = [s for s in interface if s["aa"] in replaceable]
+    near = [s for s in candidates if s["acid_distance"] is not None and s["acid_distance"] <= acid_cutoff]
+    pool = near if near else candidates
+    if near:
+        pool = sorted(near, key=lambda s: (s["acid_distance"], s["n_contacts"]))
+    else:
+        warnings.append(f"No replaceable interface residue within {acid_cutoff} A of a target Asp/Glu; "
+                        "falling back to all replaceable interface residues (weaker rationale).")
+        pool = sorted(candidates, key=lambda s: s["n_contacts"])
+    if not pool:
+        raise InputFailure(f"No interface residue of type [{replaceable}] to replace with histidine.")
+
+    variants = []
+    for n in sorted(set(n_his_options)):
+        if n > len(pool):
+            warnings.append(f"Only {len(pool)} candidate sites; skipping the {n}-His variant.")
+            continue
+        sites = pool[:n]
+        chars = list(seq)
+        muts = []
+        for s in sorted(sites, key=lambda s: s["position"]):
+            muts.append(f"{s['aa']}{s['position']}H")
+            chars[s["position"] - 1] = "H"
+        variants.append({"variant_id": f"his{n}", "n_his_added": n, "mutations": muts,
+                         "sequence": "".join(chars)})
+
+    return {
+        "parent_sequence": seq,
+        "variants": variants,
+        "protonation": {
+            "assumed_his_pka": assumed_his_pka,
+            f"protonated_at_pH_{ph_low}": round(his_protonated_fraction(assumed_his_pka, ph_low), 3),
+            f"protonated_at_pH_{ph_high}": round(his_protonated_fraction(assumed_his_pka, ph_high), 3),
+        },
+        "warnings": warnings,
+        "caveat": "Heuristic proposal only; not validated and not a binding prediction.",
+    }
+
+
+def epitope_conservation(target_residues: list, ortholog_seq: str, epitope_resnums: list,
+                         ortholog_label: str = "ortholog") -> dict:
+    """
+    Checks whether epitope residues are conserved in another species.
+
+    target_residues: [(resnum, aa), ...] for the target chain as it appears in
+      the PDB (use target_contact_residues' companion, or build it from the
+      chain). ortholog_seq: the other species' sequence (full or domain).
+    epitope_resnums: PDB residue numbers to check (e.g. the target residues
+      the binder contacts).
+
+    Uses a local alignment, so a trimmed target aligns to a longer ortholog.
+    "similar" means BLOSUM62 > 0. Conservation is necessary, not sufficient,
+    for cross-reactivity: identical residues can still sit in a different
+    local structure.
+    """
+    from Bio.Align import PairwiseAligner, substitution_matrices
+    if not target_residues:
+        raise InputFailure("target_residues is empty.")
+    ortholog_seq = "".join(ortholog_seq.split()).upper()
+    if not ortholog_seq or set(ortholog_seq) - _CANONICAL_AA:
+        raise InputFailure("ortholog_seq must contain only the 20 standard amino acids.")
+
+    target_seq = "".join(aa for _, aa in target_residues)
+    idx_of = {resnum: i for i, (resnum, _) in enumerate(target_residues)}
+    blosum = substitution_matrices.load("BLOSUM62")
+    aligner = PairwiseAligner()
+    aligner.mode = "local"
+    aligner.substitution_matrix = blosum
+    aligner.open_gap_score = -10
+    aligner.extend_gap_score = -0.5
+    aln = aligner.align(target_seq, ortholog_seq)[0]
+
+    mapping = {}
+    for (t0, t1), (q0, q1) in zip(*aln.aligned):
+        for k in range(t1 - t0):
+            mapping[t0 + k] = q0 + k
+
+    rows = []
+    for resnum in epitope_resnums:
+        if resnum not in idx_of:
+            rows.append({"resnum": resnum, "human": None, ortholog_label: None, "status": "not_in_target"})
+            continue
+        i = idx_of[resnum]
+        a = target_residues[i][1]
+        if i not in mapping:
+            rows.append({"resnum": resnum, "human": a, ortholog_label: None, "status": "unaligned"})
+            continue
+        b = ortholog_seq[mapping[i]]
+        status = "identical" if a == b else ("similar" if blosum[a][b] > 0 else "different")
+        rows.append({"resnum": resnum, "human": a, ortholog_label: b, "status": status})
+
+    scored = [r for r in rows if r["status"] in ("identical", "similar", "different")]
+    n = len(scored)
+    ident = sum(r["status"] == "identical" for r in scored)
+    simil = sum(r["status"] in ("identical", "similar") for r in scored)
+    return {
+        "n_epitope_residues": len(rows),
+        "n_scored": n,
+        "identity": round(ident / n, 3) if n else None,
+        "similarity": round(simil / n, 3) if n else None,
+        "not_conserved": [r for r in rows if r["status"] == "different"],
+        "unscored": [r for r in rows if r["status"] in ("unaligned", "not_in_target")],
+        "per_residue": rows,
+        "note": "Conservation is necessary, not sufficient, for cross-species binding.",
+    }
+
+
+def rank_designs(designs: list, metric_candidates=("Average_i_pTM", "i_pTM", "Average_pLDDT", "pLDDT"),
+                 higher_is_better: bool = True) -> list:
+    """
+    Orders BindCraftDesign objects by the first metric in `metric_candidates`
+    that every design has as a number. Raises OutputFailure listing the
+    metrics that do exist if none match, rather than guessing.
+    """
+    if not designs:
+        return []
+    for name in metric_candidates:
+        if all(isinstance(d.metrics.get(name), (int, float)) for d in designs):
+            return sorted(designs, key=lambda d: d.metrics[name], reverse=higher_is_better)
+    available = sorted({k for d in designs for k, v in d.metrics.items() if isinstance(v, (int, float))})
+    raise OutputFailure(f"None of {list(metric_candidates)} found as a numeric metric on every design. "
+                        f"Available numeric metrics: {available}")
+
+
+def export_competition_csv(entries: list, out_path: str, max_designs: int = 20,
+                           min_len: int = 10, max_len: int = 250,
+                           molecule_class: str = "protein") -> dict:
+    """
+    Writes name,sequence,molecule_class, in the order given (best first).
+
+    entries: [{"name": ..., "sequence": ...}, ...]. Invalid or duplicate
+    sequences are skipped and reported, never silently kept. Stops at
+    `max_designs`. Defaults match the Anthropic x Adaptyv rules as published
+    (10-250 residues, at most 20 designs); re-check the live rules before
+    submitting, since they can change.
+    """
+    written, skipped, seen_seq, seen_name = [], [], set(), set()
+    for e in entries:
+        name, seq = str(e.get("name", "")).strip(), "".join(str(e.get("sequence", "")).split()).upper()
+        reason = None
+        if not name or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            reason = "name missing or has characters outside A-Z a-z 0-9 _ . -"
+        elif name in seen_name:
+            reason = "duplicate name"
+        elif not seq or set(seq) - _CANONICAL_AA:
+            reason = f"non-standard characters: {sorted(set(seq) - _CANONICAL_AA)}"
+        elif not (min_len <= len(seq) <= max_len):
+            reason = f"length {len(seq)} outside {min_len}-{max_len}"
+        elif seq in seen_seq:
+            reason = "duplicate sequence"
+        if reason:
+            skipped.append({"name": name, "reason": reason})
+            continue
+        if len(written) >= max_designs:
+            skipped.append({"name": name, "reason": f"over the {max_designs}-design limit"})
+            continue
+        seen_seq.add(seq); seen_name.add(name)
+        written.append({"name": name, "sequence": seq, "molecule_class": molecule_class})
+
+    if not written:
+        raise OutputFailure(f"No valid designs to write. Skipped: {skipped}")
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    with open(out_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["name", "sequence", "molecule_class"])
+        w.writeheader()
+        w.writerows(written)
+    return {"path": out_path, "n_written": len(written), "skipped": skipped}
+
+
+
 if __name__ == "__main__":
     request = DesignRequest(
         target_name="PDL1",
