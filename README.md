@@ -52,6 +52,26 @@ print(result["oryqeva_score"])   # developability probability (0-1)
 print(result["final_sequence"])  # ready-to-synthesize sequence
 ```
 
+## Third-party code
+
+`third_party/bindcraft_mompnn/` is a modified copy of [BindCraft](https://github.com/martinpacesa/BindCraft)
+(Pacesa et al., MIT License) in which the binder-sequence redesign step uses MoMPNN instead of the built-in
+ProteinMPNN/JAX implementation. It keeps its own `LICENSE` and has a `NOTICE.md` listing every change.
+MoMPNN is the ProteinMPNN architecture (Dauparas et al., MIT) with a solubility-tuned checkpoint, so ProteinMPNN's
+code is still used.
+
+**Status: untested inside a full GPU run, and whether it improves binder quality is not measured.** The default
+`run_bindcraft()` still uses a standard BindCraft install; nothing changes unless you point `bindcraft_root` at this copy.
+
+To try it (keep your working BindCraft install untouched):
+
+```bash
+ln -s ~/BindCraft/params ~/Oryqeva/third_party/bindcraft_mompnn/params   # reuse the AF2 weights
+python3 -m venv ~/mpnn_env && ~/mpnn_env/bin/pip install torch numpy       # PyTorch for MoMPNN
+export ORYQEVA_MPNN_PYTHON=~/mpnn_env/bin/python
+# then: run_bindcraft(..., bindcraft_root="~/Oryqeva/third_party/bindcraft_mompnn")
+```
+
 ## Author
 
 Ahmed Salama — Final-year Biotechnology and Genetic Engineering student, Helwan National University, Egypt. Research Assistant at AGERI.
