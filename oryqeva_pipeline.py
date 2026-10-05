@@ -873,7 +873,10 @@ def get_final_conjugation_strategy(
 
 # ── BindCraft backend (validation, settings builder, environment preflight, run + output parsing) ──
 BACKEND_VERSION = "0.1.0"
-DEFAULT_BINDCRAFT_ROOT = "/content/BindCraft"
+DEFAULT_BINDCRAFT_ROOT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "third_party", "bindcraft_mompnn"
+)
 
 FILTER_FILES = {
     "default": "default_filters.json",
@@ -1506,7 +1509,7 @@ def run_bindcraft(
     filter_profile: str = "default",
     advanced_profile: str = "default_4stage_multimer",
     advanced_overrides: Optional[dict] = None,
-    bindcraft_root: Optional[str] = None,
+    bindcraft_root: Optional[str] = None,  # default: third_party/bindcraft_mompnn (MoMPNN)
     python_exe: Optional[str] = None,
     design_root: Optional[str] = None,
     timeout_hours: float = 11.0,
